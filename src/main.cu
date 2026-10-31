@@ -281,7 +281,8 @@ int main(int argc, char** argv) {
     using clock = std::chrono::steady_clock;
     auto start = clock::now(), last_status = start;
     double checked = 0;
-    long found = 0, rejected = 0;
+    const std::vector<Prefix> requested = active;
+    long found = 0, mismatched = 0;
     int groups = 1;
     std::vector<Match> matches(MATCH_CAP);
 
@@ -317,7 +318,11 @@ int main(int argc, char** argv) {
                     j++;
                 }
                 if (hit.empty()) {
-                    rejected++;  // range edge or a key whose prefix was just removed
+                    // Either a later hit for a prefix already found (normal), or the GPU
+                    // flagged a key whose address matches nothing: a GPU/host disagreement.
+                    bool any = false;
+                    for (auto& r : requested) any |= ki.address.compare(0, r.text.size(), r.text) == 0;
+                    if (!any) mismatched++;
                     continue;
                 }
                 found++;
@@ -349,8 +354,9 @@ int main(int argc, char** argv) {
         }
     }
     fprintf(stderr, "\n");
-    if (rejected > 1000)
-        fprintf(stderr, "note: %ld GPU candidates failed host verification\n", rejected);
+    if (mismatched)
+        fprintf(stderr, "WARNING: %ld GPU candidates matched no prefix on the host; run --selftest\n",
+                mismatched);
     if (out_fd >= 0) close(out_fd);
     return 0;
 }

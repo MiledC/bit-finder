@@ -23,7 +23,13 @@ test: tests/test_cpu
 	./tests/test_cpu
 	python3 tests/ref.py ./tests/test_cpu
 
+# Real GPU searches, every match checked with libsecp256k1 (needs coincurve).
+e2e: vanity
+	tests/e2e.sh $(PY)
+
+PY ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
+
 clean:
 	rm -f vanity tests/test_cpu
 
-.PHONY: all test clean
+.PHONY: all test e2e clean

@@ -37,6 +37,31 @@ At startup it prints how many keys each prefix needs on average, and the status
 line shows the expected time to a 50% chance of the next hit. Each extra
 character costs about 58x.
 
+## Testing
+
+Three layers, each independent of the one before:
+
+| Command | Where | What it proves |
+| --- | --- | --- |
+| `make test` | any machine | the crypto code (compiled for CPU) matches a pure-Python reference: field maths, SHA-256, RIPEMD-160, keys, addresses, WIF, prefix ranges |
+| `./vanity --selftest` | GPU | the real kernels produce correct starting points and find planted targets for all six key variants |
+| `make e2e` | GPU | real searches; every match re-derived with libsecp256k1 (Bitcoin Core's library), then tampered copies must fail |
+
+To check results from a real run with a library that shares no code with this
+program:
+
+```sh
+python3 -m venv .venv && .venv/bin/pip install coincurve
+.venv/bin/python tests/verify.py found.txt
+```
+
+For each match it checks that the WIF decodes to the hex key, that
+libsecp256k1 derives exactly the printed public key, that the hash of that key
+is exactly the printed address, that the address has the claimed prefix, and
+that a signature made with the private key verifies against the public key. For
+extra assurance, import the WIF into a wallet such as Electrum on an offline
+machine and confirm it shows the same address.
+
 ## How it works
 
 - **Keys.** The host reads a 256-bit seed from `/dev/urandom`. Each GPU thread

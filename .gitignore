@@ -3,3 +3,4 @@ tests/test_cpu
 *.txt
 secrets/
 __pycache__/
+.venv/
