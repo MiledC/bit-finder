@@ -79,7 +79,7 @@ static void test_fast_hash160(const std::vector<ge>& pow2) {
         sha256(pub, 65, sh);
         ripemd160(sh, 32, h);
         uint32_t fast[5];
-        hash160_uncompressed(fast, &p);
+        hash160_uncompressed(fast, &p.x, &p.y);
         uint8_t fb[20];
         for (int i = 0; i < 5; i++)
             for (int j = 0; j < 4; j++) fb[4 * i + j] = (uint8_t)(fast[i] >> (8 * j));
@@ -93,42 +93,78 @@ static void test_fast_hash160(const std::vector<ge>& pow2) {
 // The batched walk must produce exactly the points (k+1)G .. (k+GROUP)G.
 static void test_walk(const std::vector<ge>& pow2, const std::vector<ge>& jg) {
     std::vector<uint64_t> everything = {0, ~0ull};
-    std::vector<Match> out(GROUP);
+    const uint32_t per = 6 * GROUP;
+    std::vector<Match> out(per);
     for (int t = 0; t < 3; t++) {
-        uint32_t k[8], k0[8];
+        uint32_t k[8];
         rand_key(k);
-        memcpy(k0, k, sizeof k);
         ge P;
         scalar_mul_g(&P, k, pow2.data());
         for (int round = 0; round < 2; round++) {
             uint32_t count = 0;
             uint32_t base[8];
             memcpy(base, k, sizeof k);
-            walk_group(&P, k, jg.data(), everything.data(), 1, out.data(), &count, GROUP);
-            CHECK(count == GROUP, "walk reported %u keys", count);
-            // Results come out in reverse; check the set is base+1..base+GROUP.
+            walk_group(&P, k, jg.data(), everything.data(), 1, out.data(), &count, per);
+            CHECK(count == per, "walk reported %u keys", count);
+            // Points come out in reverse, six variants each.
             for (uint32_t i = 0; i < count; i++) {
                 uint32_t want[8];
-                sc_add_u32(want, base, GROUP - i);
-                CHECK(memcmp(want, out[i].key, 32) == 0, "walk key %u wrong", i);
+                sc_add_u32(want, base, GROUP - i / 6);
+                CHECK(memcmp(want, out[i].key, 32) == 0 && out[i].variant == i % 6, "walk key %u wrong", i);
             }
             ge Q;
             scalar_mul_g(&Q, k, pow2.data());
             CHECK(fe_eq(&Q.x, &P.x) && fe_eq(&Q.y, &P.y), "walk end point != kG");
         }
-        // A real prefix: plant the target at offset 37 and make sure the walk finds it.
-        uint32_t target[8];
-        sc_add_u32(target, k, 37);
-        std::string addr = describe_key(target, pow2.data()).address;
-        Prefix pre;
-        std::string err;
-        CHECK(build_prefix(addr.substr(0, 7), pre, err), "build_prefix: %s", err.c_str());
-        std::vector<uint64_t> rs = merge_ranges({pre});
+        // Real prefixes: plant one target per variant and make sure the walk finds each.
+        std::vector<Prefix> pres;
+        std::vector<std::vector<uint32_t>> targets;
+        for (uint32_t v = 0; v < 6; v++) {
+            std::vector<uint32_t> walk_key(8), priv(8);
+            sc_add_u32(walk_key.data(), k, 37 + 11 * v);
+            endo_key(priv.data(), walk_key.data(), v);
+            std::string addr = describe_key(priv.data(), pow2.data()).address;
+            Prefix pre;
+            std::string err;
+            CHECK(build_prefix(addr.substr(0, 7), pre, err), "build_prefix: %s", err.c_str());
+            pres.push_back(pre);
+            walk_key.push_back(v);
+            targets.push_back(walk_key);
+        }
+        std::vector<uint64_t> rs = merge_ranges(pres);
         uint32_t count = 0;
-        walk_group(&P, k, jg.data(), rs.data(), (int)rs.size() / 2, out.data(), &count, GROUP);
-        bool found = false;
-        for (uint32_t i = 0; i < count && i < GROUP; i++) found |= memcmp(out[i].key, target, 32) == 0;
-        CHECK(found, "walk missed planted prefix %s", addr.substr(0, 7).c_str());
+        walk_group(&P, k, jg.data(), rs.data(), (int)rs.size() / 2, out.data(), &count, per);
+        for (auto& tg : targets) {
+            bool found = false;
+            for (uint32_t i = 0; i < count && i < per; i++)
+                found |= memcmp(out[i].key, tg.data(), 32) == 0 && out[i].variant == tg[8];
+            CHECK(found, "walk missed planted variant %u", tg[8]);
+        }
+        CHECK(count <= 8, "walk flagged %u candidates for 6 targets", count);
+    }
+}
+
+// endo_key must give the private key of each sibling point.
+static void test_endo(const std::vector<ge>& pow2) {
+    fe beta, beta2, zero;
+    get_beta(&beta, &beta2);
+    fe_set_u32(&zero, 0);
+    for (int t = 0; t < 5; t++) {
+        uint32_t k[8];
+        rand_key(k);
+        ge p;
+        scalar_mul_g(&p, k, pow2.data());
+        for (uint32_t v = 0; v < 6; v++) {
+            fe x = p.x, y = p.y;
+            if (v >= 4) fe_mul(&x, &p.x, &beta2);
+            else if (v >= 2) fe_mul(&x, &p.x, &beta);
+            if (v & 1) fe_sub(&y, &zero, &p.y);
+            uint32_t r[8];
+            endo_key(r, k, v);
+            ge q;
+            scalar_mul_g(&q, r, pow2.data());
+            CHECK(fe_eq(&q.x, &x) && fe_eq(&q.y, &y), "endo variant %u wrong", v);
+        }
     }
 }
 
@@ -142,7 +178,7 @@ static void test_prefix_ranges(const std::vector<ge>& pow2) {
         ge p;
         scalar_mul_g(&p, k, pow2.data());
         uint32_t h[5];
-        hash160_uncompressed(h, &p);
+        hash160_uncompressed(h, &p.x, &p.y);
         tops.push_back(hash160_top64(h));
         addrs.push_back(describe_key(k, pow2.data()).address);
     }
@@ -233,6 +269,7 @@ int main(int argc, char** argv) {
     test_known_vectors(pow2);
     test_fast_hash160(pow2);
     test_derive_key();
+    test_endo(pow2);
     test_walk(pow2, jg);
     test_prefix_ranges(pow2);
     if (failures) {

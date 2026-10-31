@@ -230,6 +230,64 @@ HD bool sc_is_zero(const uint32_t k[8]) {
     return t == 0;
 }
 
+HD void sc_add(uint32_t r[8], const uint32_t a[8], const uint32_t b[8]) {
+    uint64_t c = 0;
+    for (int i = 0; i < 8; i++) {
+        c += (uint64_t)a[i] + b[i];
+        r[i] = (uint32_t)c;
+        c >>= 32;
+    }
+    if (c || sc_geq_n(r)) sc_sub_n(r);
+}
+
+// r = n - k (k nonzero)
+HD void sc_neg(uint32_t r[8], const uint32_t k[8]) {
+    const uint32_t n[8] = {0xD0364141u, 0xBFD25E8Cu, 0xAF48A03Bu, 0xBAAEDCE6u,
+                           0xFFFFFFFEu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+    int64_t c = 0;
+    for (int i = 0; i < 8; i++) {
+        c += (int64_t)n[i] - k[i];
+        r[i] = (uint32_t)c;
+        c >>= 32;
+    }
+}
+
+// r = a * b mod n by double-and-add. Slow; only used on the host per match.
+HD void sc_mul(uint32_t r[8], const uint32_t a[8], const uint32_t b[8]) {
+    uint32_t acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int i = 255; i >= 0; i--) {
+        sc_add(acc, acc, acc);
+        if ((b[i >> 5] >> (i & 31)) & 1) sc_add(acc, acc, a);
+    }
+    for (int i = 0; i < 8; i++) r[i] = acc[i];
+}
+
+// ---- endomorphism ------------------------------------------------------------
+// lambda * (x, y) = (beta * x, y), and -(x, y) = (x, p - y). One computed point
+// therefore yields six keys: k, n-k, lambda k, n - lambda k, lambda^2 k, n - lambda^2 k.
+
+HD void get_beta(fe* b, fe* b2) {
+    const uint32_t v1[8] = {0x719501EEu, 0xC1396C28u, 0x12F58995u, 0x9CF04975u,
+                            0xAC3434E9u, 0x6E64479Eu, 0x657C0710u, 0x7AE96A2Bu};
+    const uint32_t v2[8] = {0x8E6AFA40u, 0x3EC693D6u, 0xED0A766Au, 0x630FB68Au,
+                            0x53CBCB16u, 0x919BB861u, 0x9A83F8EFu, 0x851695D4u};
+    for (int i = 0; i < 8; i++) {
+        b->v[i] = v1[i];
+        b2->v[i] = v2[i];
+    }
+}
+
+// The private key for the point found as `variant` (0..5) of key k.
+HD void endo_key(uint32_t r[8], const uint32_t k[8], uint32_t variant) {
+    const uint32_t lam[8] = {0x1B23BD72u, 0xDF02967Cu, 0x20816678u, 0x122E22EAu,
+                             0x8812645Au, 0xA5261C02u, 0xC05C30E0u, 0x5363AD4Cu};
+    uint32_t t[8];
+    for (int i = 0; i < 8; i++) t[i] = k[i];
+    for (uint32_t j = 0; j < variant / 2; j++) sc_mul(t, t, lam);
+    if (variant & 1) sc_neg(t, t);
+    for (int i = 0; i < 8; i++) r[i] = t[i];
+}
+
 // r = k*G using a table pow2[i] = 2^i * G. k must be in [1, n).
 // Partial sums can never equal +-2^i G for k < n, so ge_add is always valid.
 HD void scalar_mul_g(ge* r, const uint32_t k[8], const ge* pow2) {

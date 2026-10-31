@@ -90,9 +90,12 @@ static int selftest(const ge* d_pow2, const ge* d_jg, const std::vector<ge>& pow
         // Plant one target per thread at a different offset inside the first group.
         std::vector<uint32_t> tk(8);
         sc_add_u32(tk.data(), st[t].k, 1 + (uint32_t)(t * 7) % GROUP);
+        uint32_t priv[8];
+        endo_key(priv, tk.data(), t % 6);  // cycle through all six sibling keys
+        tk.push_back(t % 6);
         Prefix p;
         std::string err;
-        build_prefix(describe_key(tk.data(), pow2.data()).address.substr(0, 9), p, err);
+        build_prefix(describe_key(priv, pow2.data()).address.substr(0, 9), p, err);
         planted.push_back(p);
         targets.push_back(tk);
     }
@@ -110,7 +113,7 @@ static int selftest(const ge* d_pow2, const ge* d_jg, const std::vector<ge>& pow
     int missed = 0;
     for (auto& tk : targets) {
         bool hit = false;
-        for (auto& x : m) hit |= memcmp(x.key, tk.data(), 32) == 0;
+        for (auto& x : m) hit |= memcmp(x.key, tk.data(), 32) == 0 && x.variant == tk[8];
         missed += !hit;
     }
     printf("walk kernel:  %s (%d/%d planted prefixes missed, %u candidates)\n", missed ? "FAIL" : "ok",
@@ -234,8 +237,8 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
     if (blocks <= 0) blocks = prop.multiProcessorCount * 16;
     uint32_t nthreads = (uint32_t)blocks * threads;
-    fprintf(stderr, "device %d: %s, %d SMs, %u threads, %d keys per inversion\n", device, prop.name,
-            prop.multiProcessorCount, nthreads, GROUP);
+    fprintf(stderr, "device %d: %s, %d SMs, %u threads, %d points per inversion, 6 keys per point\n",
+            device, prop.name, prop.multiProcessorCount, nthreads, GROUP);
 
     std::vector<ge> pow2 = make_pow2_table(), jg = make_jg_table();
     ge *d_pow2, *d_jg;
@@ -289,7 +292,7 @@ int main(int argc, char** argv) {
         uint32_t count = 0;
         CUDA_CHECK(cudaMemcpy(&count, d_count, sizeof count, cudaMemcpyDeviceToHost));
         double secs = std::chrono::duration<double>(clock::now() - t0).count();
-        checked += (double)nthreads * GROUP * groups;
+        checked += 6.0 * nthreads * GROUP * groups;
         if (secs < 0.25 && groups < 1024) groups *= 2;  // aim for launches of roughly a second
 
         if (count) {
@@ -298,7 +301,9 @@ int main(int argc, char** argv) {
             CUDA_CHECK(cudaMemset(d_count, 0, sizeof(uint32_t)));
             bool changed = false;
             for (uint32_t i = 0; i < n && !active.empty(); i++) {
-                KeyInfo ki = describe_key(matches[i].key, pow2.data());
+                uint32_t priv[8];
+                endo_key(priv, matches[i].key, matches[i].variant);
+                KeyInfo ki = describe_key(priv, pow2.data());
                 std::string hit;
                 for (size_t j = 0; j < active.size();) {
                     if (ki.address.compare(0, active[j].text.size(), active[j].text) == 0) {

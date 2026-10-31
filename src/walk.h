@@ -10,12 +10,12 @@
 #endif
 
 // hash160 of the uncompressed pubkey 04||X||Y, as 5 little-endian RIPEMD words.
-HD void hash160_uncompressed(uint32_t out[5], const ge* p) {
+HD void hash160_uncompressed(uint32_t out[5], const fe* x, const fe* y) {
     // D = big-endian words of X||Y; message word m = byte-shifted by one for the 0x04.
     uint32_t D[16];
     for (int i = 0; i < 8; i++) {
-        D[i] = p->x.v[7 - i];
-        D[8 + i] = p->y.v[7 - i];
+        D[i] = x->v[7 - i];
+        D[8 + i] = y->v[7 - i];
     }
     uint32_t m[16];
     m[0] = (0x04u << 24) | (D[0] >> 8);
@@ -82,8 +82,9 @@ HD uint32_t bump_counter(uint32_t* c) {
 #endif
 }
 
-// Check the GROUP keys k+1 .. k+GROUP, whose points are P + jG[i] (jG[i] = (i+1)G),
-// using one field inversion. Advances P and k by GROUP.
+// Check the GROUP points P + jG[i] (jG[i] = (i+1)G), i.e. keys k+1 .. k+GROUP, using
+// one field inversion, plus the five endomorphism/negation siblings of each point.
+// Advances P and k by GROUP.
 HD void walk_group(ge* P, uint32_t k[8], const ge* jG, const uint64_t* ranges, int nranges,
                    Match* out, uint32_t* count, uint32_t cap) {
     fe pre[GROUP];
@@ -94,8 +95,9 @@ HD void walk_group(ge* P, uint32_t k[8], const ge* jG, const uint64_t* ranges, i
         fe_sub(&dx, &jG[i].x, &P->x);
         fe_mul(&acc, &acc, &dx);
     }
-    fe inv;
-    fe_inv(&inv, &acc);  // inv = 1 / prod(dx_0..dx_{G-1})
+    fe inv, beta, beta2;
+    fe_inv(&inv, &acc);
+    get_beta(&beta, &beta2);  // inv = 1 / prod(dx_0..dx_{G-1})
 
     ge next;
     for (int i = GROUP - 1; i >= 0; i--) {
@@ -115,11 +117,28 @@ HD void walk_group(ge* P, uint32_t k[8], const ge* jG, const uint64_t* ranges, i
         fe_sub(&q.y, &t, &P->y);
         if (i == GROUP - 1) next = q;
 
-        uint32_t h[5];
-        hash160_uncompressed(h, &q);
-        if (in_ranges(hash160_top64(h), ranges, nranges)) {
-            uint32_t slot = bump_counter(count);
-            if (slot < cap) sc_add_u32(out[slot].key, k, (uint32_t)(i + 1));
+        fe ny, bx, b2x, zero;
+        fe_set_u32(&zero, 0);
+        fe_sub(&ny, &zero, &q.y);
+        fe_mul(&bx, &q.x, &beta);
+        fe_mul(&b2x, &q.x, &beta2);
+#ifdef __CUDA_ARCH__
+#pragma unroll 1
+#endif
+        for (uint32_t v = 0; v < 6; v++) {
+            fe cx = q.x, cy = q.y;
+            if (v >= 4) cx = b2x;
+            else if (v >= 2) cx = bx;
+            if (v & 1) cy = ny;
+            uint32_t h[5];
+            hash160_uncompressed(h, &cx, &cy);
+            if (in_ranges(hash160_top64(h), ranges, nranges)) {
+                uint32_t slot = bump_counter(count);
+                if (slot < cap) {
+                    sc_add_u32(out[slot].key, k, (uint32_t)(i + 1));
+                    out[slot].variant = v;
+                }
+            }
         }
     }
     *P = next;

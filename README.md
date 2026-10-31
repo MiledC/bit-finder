@@ -45,12 +45,25 @@ character costs about 58x.
   at independent random points in the 2^256 key space.
 - **Walk.** Each thread adds `G, 2G, ..., 256G` to its current point and
   shares one modular inversion across all 256 additions (Montgomery's trick).
+- **Six keys per point.** secp256k1 lets one computed point stand for six
+  keys: flipping the sign of y gives the key `n-k`, and multiplying x by a
+  constant β gives the key `λ·k` (and again for `λ²·k`). The GPU reports the
+  walk key plus which of the six it was; the host turns that back into the real
+  private key.
 - **Matching.** Every prefix is turned into intervals over the first 64 bits of
   hash160 once, on the host. The GPU only does a binary search over the merged
   intervals, so 1 prefix and 10,000 prefixes cost about the same. The intervals
   are slightly conservative at the edges, so the host rejects the rare near-miss.
 - **Checks.** All crypto lives in headers compiled for both GPU and CPU, so
   `make test` exercises the same code against a pure-Python reference.
+
+## Speed
+
+About 1.25G keys/s on an RTX A4000. Hashing is ~84% of the work: an
+uncompressed public key is 65 bytes, so each key costs two SHA-256 blocks plus
+RIPEMD-160, and that can't be shared between keys. The hashing already runs near
+the card's integer throughput, so the main ways to go faster are more GPUs or
+compressed keys (one SHA-256 block instead of two).
 
 ## Layout
 

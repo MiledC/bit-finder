@@ -9,7 +9,8 @@
 #define HD inline
 #endif
 
-// Pairs of [lo, hi] (inclusive) over the top 64 bits of hash160.
+// A GPU hit: the private key is endo_key(key, variant), see secp256k1.h.
 struct Match {
-    uint32_t key[8];  // private key, little-endian 32-bit limbs
+    uint32_t key[8];  // walk key, little-endian 32-bit limbs
+    uint32_t variant;
 };
