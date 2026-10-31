@@ -1,0 +1,5 @@
+vanity
+tests/test_cpu
+*.txt
+secrets/
+__pycache__/
