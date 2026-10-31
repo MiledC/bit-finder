@@ -261,3 +261,35 @@ inline std::vector<uint64_t> merge_ranges(const std::vector<Prefix>& prefixes) {
     }
     return flat;
 }
+
+// Merged ranges plus the bucket bitmap the GPU checks first (Filter in walk.h).
+struct RangeSet {
+    std::vector<uint64_t> ranges;
+    std::vector<uint32_t> bits;
+    uint32_t shift;
+};
+
+inline RangeSet make_range_set(std::vector<uint64_t> flat) {
+    RangeSet rs;
+    rs.ranges = std::move(flat);
+    size_t n = rs.ranges.size() / 2;
+    // About 64 buckets per range, so only a few percent of keys reach the binary
+    // search. 2^16 to 2^24 buckets: 8 KB to 2 MB, small enough to stay in L2.
+    int log2b = 16;
+    while (log2b < 24 && ((uint64_t)1 << log2b) < 64 * (uint64_t)n) log2b++;
+    rs.shift = 64 - log2b;
+    rs.bits.assign(((size_t)1 << log2b) / 32, 0);
+    for (size_t i = 0; i < n; i++) {
+        uint64_t a = rs.ranges[2 * i] >> rs.shift, b = rs.ranges[2 * i + 1] >> rs.shift;
+        for (uint64_t x = a; x <= b; x++) rs.bits[x >> 5] |= 1u << (x & 31);
+    }
+    return rs;
+}
+
+inline RangeSet build_range_set(const std::vector<Prefix>& prefixes) {
+    return make_range_set(merge_ranges(prefixes));
+}
+
+inline Filter host_filter(const RangeSet& rs) {
+    return {rs.bits.data(), rs.shift, rs.ranges.data(), (int)rs.ranges.size() / 2};
+}

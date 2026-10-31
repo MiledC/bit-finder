@@ -92,7 +92,7 @@ static void test_fast_hash160(const std::vector<ge>& pow2) {
 
 // The batched walk must produce exactly the points (k+1)G .. (k+GROUP)G.
 static void test_walk(const std::vector<ge>& pow2, const std::vector<ge>& jg) {
-    std::vector<uint64_t> everything = {0, ~0ull};
+    RangeSet everything = make_range_set({0, ~0ull});
     const uint32_t per = 6 * GROUP;
     std::vector<Match> out(per);
     for (int t = 0; t < 3; t++) {
@@ -104,7 +104,7 @@ static void test_walk(const std::vector<ge>& pow2, const std::vector<ge>& jg) {
             uint32_t count = 0;
             uint32_t base[8];
             memcpy(base, k, sizeof k);
-            walk_group(&P, k, jg.data(), everything.data(), 1, out.data(), &count, per);
+            walk_group(&P, k, jg.data(), host_filter(everything), out.data(), &count, per);
             CHECK(count == per, "walk reported %u keys", count);
             // Points come out in reverse, six variants each.
             for (uint32_t i = 0; i < count; i++) {
@@ -131,9 +131,9 @@ static void test_walk(const std::vector<ge>& pow2, const std::vector<ge>& jg) {
             walk_key.push_back(v);
             targets.push_back(walk_key);
         }
-        std::vector<uint64_t> rs = merge_ranges(pres);
+        RangeSet rs = build_range_set(pres);
         uint32_t count = 0;
-        walk_group(&P, k, jg.data(), rs.data(), (int)rs.size() / 2, out.data(), &count, per);
+        walk_group(&P, k, jg.data(), host_filter(rs), out.data(), &count, per);
         for (auto& tg : targets) {
             bool found = false;
             for (uint32_t i = 0; i < count && i < per; i++)
@@ -220,6 +220,52 @@ static void test_prefix_ranges(const std::vector<ge>& pow2) {
     CHECK(build_prefix("11", pre, err) && fabs(pre.probability - 1.0 / 256) < 1e-9, "prob(11) = %f", pre.probability);
 }
 
+// The bucket bitmap must never reject a value the ranges accept, at any list size.
+static void test_filter() {
+    for (int n : {1, 3, 1000, 40000, 300000}) {
+        // Narrow ranges like long prefixes give, at random places.
+        std::vector<uint64_t> los;
+        for (int i = 0; i < n; i++) los.push_back(rng());
+        std::sort(los.begin(), los.end());
+        std::vector<uint64_t> ends;
+        for (uint64_t lo : los) {
+            uint64_t hi = lo + (rng() >> 30);
+            if (hi < lo || (!ends.empty() && lo <= ends.back() + 1)) continue;
+            ends.push_back(lo);
+            ends.push_back(hi);
+        }
+        RangeSet rs = make_range_set(ends);
+        Filter f = host_filter(rs);
+        std::vector<uint64_t> probes;
+        for (int i = 0; i < 200000; i++) probes.push_back(rng());
+        for (uint64_t e : ends) {
+            probes.push_back(e - 1);
+            probes.push_back(e);
+            probes.push_back(e + 1);
+        }
+        int wrong = 0, inside = 0;
+        for (uint64_t v : probes) {
+            bool want = in_ranges(v, f.ranges, f.n);
+            inside += want;
+            wrong += filter_hit(v, f) != want;
+        }
+        CHECK(wrong == 0, "filter: %d disagreements with %d ranges", wrong, f.n);
+        CHECK(inside > 0 || n < 1000, "filter test never landed inside a range");
+        // Random probes should mostly be rejected by the bitmap alone.
+        {
+            long random_hits = 0;
+            for (int i = 0; i < 100000; i++) {
+                uint64_t b = rng() >> f.shift;
+                random_hits += (rs.bits[b >> 5] >> (b & 31)) & 1;
+            }
+            CHECK(random_hits < 5000, "filter: %ld/100000 random values pass the bitmap (%d ranges)",
+                  random_hits, f.n);
+        }
+    }
+    RangeSet all = make_range_set({0, ~0ull});
+    CHECK(filter_hit(0, host_filter(all)) && filter_hit(~0ull, host_filter(all)), "filter: full range");
+}
+
 static void test_derive_key() {
     uint8_t seed[32] = {0};
     uint32_t a[8], b[8], c[8];
@@ -269,6 +315,7 @@ int main(int argc, char** argv) {
     test_known_vectors(pow2);
     test_fast_hash160(pow2);
     test_derive_key();
+    test_filter();
     test_endo(pow2);
     test_walk(pow2, jg);
     test_prefix_ranges(pow2);

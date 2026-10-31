@@ -57,6 +57,27 @@ HD bool in_ranges(uint64_t v, const uint64_t* ranges, int n) {
     return found >= 0 && v <= ranges[2 * found + 1];
 }
 
+// What a hash is checked against on the GPU. Bucket b = top64 >> shift has its
+// bit set in `bits` when any range touches it. Nearly every key lands in an
+// empty bucket and costs one load, so the binary search over `ranges` only
+// runs for the few that don't, however long the prefix list is.
+struct Filter {
+    const uint32_t* bits;
+    uint32_t shift;
+    const uint64_t* ranges;
+    int n;
+};
+
+HD bool filter_hit(uint64_t v, const Filter& f) {
+    uint64_t b = v >> f.shift;
+#ifdef __CUDA_ARCH__
+    uint32_t w = __ldg(f.bits + (b >> 5));
+#else
+    uint32_t w = f.bits[b >> 5];
+#endif
+    return ((w >> (b & 31)) & 1) && in_ranges(v, f.ranges, f.n);
+}
+
 // Private key for thread `tid`: SHA-256(seed || tid || attempt) mod n, nonzero.
 // The seed comes from the OS CSPRNG on the host and never leaves the process.
 HD void derive_key(uint32_t k[8], const uint8_t seed[32], uint32_t tid) {
@@ -85,7 +106,7 @@ HD uint32_t bump_counter(uint32_t* c) {
 // Check the GROUP points P + jG[i] (jG[i] = (i+1)G), i.e. keys k+1 .. k+GROUP, using
 // one field inversion, plus the five endomorphism/negation siblings of each point.
 // Advances P and k by GROUP.
-HD void walk_group(ge* P, uint32_t k[8], const ge* jG, const uint64_t* ranges, int nranges,
+HD void walk_group(ge* P, uint32_t k[8], const ge* jG, const Filter& filter,
                    Match* out, uint32_t* count, uint32_t cap) {
     fe pre[GROUP];
     fe acc, dx;
@@ -132,7 +153,7 @@ HD void walk_group(ge* P, uint32_t k[8], const ge* jG, const uint64_t* ranges, i
             if (v & 1) cy = ny;
             uint32_t h[5];
             hash160_uncompressed(h, &cx, &cy);
-            if (in_ranges(hash160_top64(h), ranges, nranges)) {
+            if (filter_hit(hash160_top64(h), filter)) {
                 uint32_t slot = bump_counter(count);
                 if (slot < cap) {
                     sc_add_u32(out[slot].key, k, (uint32_t)(i + 1));

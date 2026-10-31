@@ -4,3 +4,4 @@ tests/test_cpu
 secrets/
 __pycache__/
 .venv/
+!bench/*.txt

@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <fstream>
+#include <set>
 
 #include "host.h"
 
@@ -40,14 +41,32 @@ __global__ void init_kernel(ThreadState* st, const ge* pow2, Seed seed) {
     st[tid] = s;
 }
 
-__global__ void walk_kernel(ThreadState* st, const ge* jg, const uint64_t* ranges, int nranges,
-                            Match* out, uint32_t* count, int groups) {
+__global__ void walk_kernel(ThreadState* st, const ge* jg, Filter filter, Match* out, uint32_t* count,
+                            int groups) {
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     ThreadState s = st[tid];
     for (int g = 0; g < groups; g++)
-        walk_group(&s.P, s.k, jg, ranges, nranges, out, count, MATCH_CAP);
+        walk_group(&s.P, s.k, jg, filter, out, count, MATCH_CAP);
     st[tid] = s;
 }
+
+// A RangeSet copied to the GPU; re-uploaded whenever the active prefixes change.
+struct DeviceFilter {
+    uint32_t* bits = nullptr;
+    uint64_t* ranges = nullptr;
+    Filter f{};
+
+    void upload(const RangeSet& rs) {
+        CUDA_CHECK(cudaFree(bits));
+        CUDA_CHECK(cudaFree(ranges));
+        CUDA_CHECK(cudaMalloc(&bits, rs.bits.size() * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc(&ranges, rs.ranges.size() * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMemcpy(bits, rs.bits.data(), rs.bits.size() * sizeof(uint32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(ranges, rs.ranges.data(), rs.ranges.size() * sizeof(uint64_t),
+                              cudaMemcpyHostToDevice));
+        f = {bits, rs.shift, ranges, (int)rs.ranges.size() / 2};
+    }
+};
 
 static bool read_seed(uint8_t out[32]) {
     int fd = open("/dev/urandom", O_RDONLY);
@@ -68,7 +87,6 @@ static int selftest(const ge* d_pow2, const ge* d_jg, const std::vector<ge>& pow
     ThreadState* d_state;
     Match* d_out;
     uint32_t* d_count;
-    uint64_t* d_ranges;
     CUDA_CHECK(cudaMalloc(&d_state, T * sizeof(ThreadState)));
     CUDA_CHECK(cudaMalloc(&d_out, MATCH_CAP * sizeof(Match)));
     CUDA_CHECK(cudaMalloc(&d_count, sizeof(uint32_t)));
@@ -101,10 +119,9 @@ static int selftest(const ge* d_pow2, const ge* d_jg, const std::vector<ge>& pow
     }
     printf("init kernel:  %s (%d/%d starting points wrong)\n", bad ? "FAIL" : "ok", bad, T);
 
-    std::vector<uint64_t> flat = merge_ranges(planted);
-    CUDA_CHECK(cudaMalloc(&d_ranges, flat.size() * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMemcpy(d_ranges, flat.data(), flat.size() * sizeof(uint64_t), cudaMemcpyHostToDevice));
-    walk_kernel<<<1, T>>>(d_state, d_jg, d_ranges, (int)flat.size() / 2, d_out, d_count, 2);
+    DeviceFilter filter;
+    filter.upload(build_range_set(planted));
+    walk_kernel<<<1, T>>>(d_state, d_jg, filter.f, d_out, d_count, 2);
     CUDA_CHECK(cudaGetLastError());
     uint32_t count;
     CUDA_CHECK(cudaMemcpy(&count, d_count, sizeof count, cudaMemcpyDeviceToHost));
@@ -153,14 +170,31 @@ static void usage(const char* argv0) {
 }
 
 static std::string human(double v) {
+    char buf[32];
+    if (v >= 1e21) {  // past the units below
+        snprintf(buf, sizeof buf, "%.2e", v);
+        return buf;
+    }
     const char* units[] = {"", "K", "M", "G", "T", "P", "E"};
     int u = 0;
     while (v >= 1000 && u < 6) {
         v /= 1000;
         u++;
     }
-    char buf[32];
     snprintf(buf, sizeof buf, "%.2f%s", v, units[u]);
+    return buf;
+}
+
+// Expected waiting time, readable from seconds up to "never".
+static std::string duration(double s) {
+    char buf[32];
+    const double year = 365.25 * 86400;
+    if (s < 120) snprintf(buf, sizeof buf, "%.0fs", s);
+    else if (s < 7200) snprintf(buf, sizeof buf, "%.0f min", s / 60);
+    else if (s < 2 * 86400) snprintf(buf, sizeof buf, "%.1f h", s / 3600);
+    else if (s < year) snprintf(buf, sizeof buf, "%.1f days", s / 86400);
+    else if (s < 1e6 * year) snprintf(buf, sizeof buf, "%.0f years", s / year);
+    else snprintf(buf, sizeof buf, "%.1e years", s / year);
     return buf;
 }
 
@@ -204,16 +238,16 @@ int main(int argc, char** argv) {
     if (texts.empty() && !run_selftest) usage(argv[0]);
 
     std::vector<Prefix> active;
+    std::set<std::string> seen;
     for (auto& t : texts) {
+        if (!seen.insert(t).second) continue;
         Prefix p;
         std::string err;
         if (!build_prefix(t, p, err)) {
             fprintf(stderr, "skipping prefix '%s': %s\n", t.c_str(), err.c_str());
             continue;
         }
-        bool dup = false;
-        for (auto& q : active) dup |= q.text == p.text;
-        if (!dup) active.push_back(p);
+        active.push_back(p);
     }
     if (active.empty() && !run_selftest) {
         fprintf(stderr, "no usable prefixes\n");
@@ -245,7 +279,6 @@ int main(int argc, char** argv) {
     ThreadState* d_state;
     Match* d_out;
     uint32_t* d_count;
-    uint64_t* d_ranges = nullptr;
     CUDA_CHECK(cudaMalloc(&d_pow2, pow2.size() * sizeof(ge)));
     CUDA_CHECK(cudaMalloc(&d_jg, jg.size() * sizeof(ge)));
     CUDA_CHECK(cudaMalloc(&d_state, (size_t)nthreads * sizeof(ThreadState)));
@@ -256,15 +289,11 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemset(d_count, 0, sizeof(uint32_t)));
     if (run_selftest) return selftest(d_pow2, d_jg, pow2);
 
-    int nranges = 0;
-    auto upload_ranges = [&]() {
-        std::vector<uint64_t> flat = merge_ranges(active);
-        if (d_ranges) CUDA_CHECK(cudaFree(d_ranges));
-        CUDA_CHECK(cudaMalloc(&d_ranges, flat.size() * sizeof(uint64_t)));
-        CUDA_CHECK(cudaMemcpy(d_ranges, flat.data(), flat.size() * sizeof(uint64_t), cudaMemcpyHostToDevice));
-        nranges = (int)flat.size() / 2;
-    };
-    upload_ranges();
+    DeviceFilter filter;
+    filter.upload(build_range_set(active));
+    if (active.size() > 20)
+        fprintf(stderr, "%zu prefixes, %d ranges, %zu KB bucket bitmap\n", active.size(), filter.f.n,
+                ((size_t)1 << (64 - filter.f.shift)) / 8192);
 
     // Starting keys are derived on the GPU from a 256-bit seed from the OS CSPRNG.
     Seed seed;
@@ -288,7 +317,7 @@ int main(int argc, char** argv) {
 
     while (!active.empty()) {
         auto t0 = clock::now();
-        walk_kernel<<<blocks, threads>>>(d_state, d_jg, d_ranges, nranges, d_out, d_count, groups);
+        walk_kernel<<<blocks, threads>>>(d_state, d_jg, filter.f, d_out, d_count, groups);
         CUDA_CHECK(cudaGetLastError());
         uint32_t count = 0;
         CUDA_CHECK(cudaMemcpy(&count, d_count, sizeof count, cudaMemcpyDeviceToHost));
@@ -339,7 +368,7 @@ int main(int argc, char** argv) {
             if (count > MATCH_CAP)
                 fprintf(stderr, "\nwarning: %u candidates in one launch, only %u checked; prefix too easy?\n",
                         count, MATCH_CAP);
-            if (changed && !active.empty()) upload_ranges();
+            if (changed && !active.empty()) filter.upload(build_range_set(active));
         }
 
         auto now = clock::now();
@@ -347,7 +376,7 @@ int main(int argc, char** argv) {
             double el = std::chrono::duration<double>(now - start).count();
             double p = 0;
             for (auto& a : active) p += a.probability;
-            std::string eta = p > 0 ? human(log(2.0) / p / (checked / el)) + "s to 50%" : "-";
+            std::string eta = p > 0 ? duration(log(2.0) / p / (checked / el)) + " to 50%" : "-";
             fprintf(stderr, "\r%s keys/s | %s checked | %ld found | %zu left | %s   ",
                     human(checked / el).c_str(), human(checked).c_str(), found, active.size(), eta.c_str());
             last_status = now;

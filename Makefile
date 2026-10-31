@@ -27,9 +27,13 @@ test: tests/test_cpu
 e2e: vanity
 	tests/e2e.sh $(PY)
 
+# Speed with one prefix vs. a 37k-address list.
+bench: vanity
+	bench/run.sh
+
 PY ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 
 clean:
 	rm -f vanity tests/test_cpu
 
-.PHONY: all test e2e clean
+.PHONY: all test e2e bench clean

@@ -16,6 +16,7 @@ make                 # builds ./vanity for the GPU in this machine
 make ARCH=sm_86      # or name the architecture explicitly
 make test            # CPU test suite + Python cross-check, no GPU needed
 ./vanity --selftest  # runs the real kernels and checks them against the CPU
+make bench           # keys/s with 1 prefix vs. bench/p2pkh-37k.txt (37,609 addresses)
 ```
 
 On the A4000 box CUDA lives in `/usr/local/cuda-12.8/bin`; add it to `PATH` first.
@@ -77,7 +78,9 @@ machine and confirm it shows the same address.
   private key.
 - **Matching.** Every prefix is turned into intervals over the first 64 bits of
   hash160 once, on the host. The GPU only does a binary search over the merged
-  intervals, so 1 prefix and 10,000 prefixes cost about the same. The intervals
+  intervals. In front of that sits a bitmap over the top bits of the hash (8 KB
+  to 2 MB, sized to the list): a key whose bucket is empty is rejected after one
+  read, so even a 37k-address list runs at single-prefix speed. The intervals
   are slightly conservative at the edges, so the host rejects the rare near-miss.
 - **Checks.** All crypto lives in headers compiled for both GPU and CPU, so
   `make test` exercises the same code against a pure-Python reference.
@@ -100,3 +103,4 @@ compressed keys (one SHA-256 block instead of two).
 | `src/host.h` | Base58, WIF, prefix → range conversion, host verification |
 | `src/main.cu` | kernels, CLI, self-test |
 | `tests/` | CPU tests and `ref.py`, the independent Python reference |
+| `bench/` | speed check with one prefix vs. a 37k-address list |
